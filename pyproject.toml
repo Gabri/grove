@@ -1,0 +1,30 @@
+[project]
+name = "grove"
+version = "0.1.0"
+description = "TUI to clone & keep in sync a tree of git repos (GitLab/GitHub/Bitbucket)"
+readme = "README.md"
+authors = [
+    { name = "Gabriele Guidi", email = "gabriele.guidi@dinova.one" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "cryptography>=48.0.0",
+    "requests>=2.34.2",
+    "textual>=8.2.7",
+]
+
+[project.scripts]
+grove = "grove.__main__:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["uv_build>=0.10.4,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+]
