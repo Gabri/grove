@@ -80,6 +80,87 @@ def test_multiple_keys_same_provider(tmp_path):
     assert tokens == {"clientx": "tok-x", "clienty": "tok-y"}
 
 
+def test_kdf_downgrade_rejected(tmp_path):
+    """A tampered header advertising weak KDF params must refuse to unlock."""
+    import json
+
+    path = tmp_path / "vault.enc"
+    create("p" * 8, path)
+    payload = json.loads(path.read_text())
+    payload["n"] = 2  # attacker lowers the work factor
+    path.write_text(json.dumps(payload))
+    with pytest.raises(VaultError, match="too weak"):
+        unlock("p" * 8, path)
+
+
+def test_kdf_upgrade_on_unlock(tmp_path, monkeypatch):
+    """Vaults created with old (weaker) params get re-encrypted on unlock."""
+    import json
+
+    path = tmp_path / "vault.enc"
+    create("p" * 8, path, kdf_n=vaultmod.MIN_N)
+    # pretend current strength is one step higher
+    monkeypatch.setattr(vaultmod, "SCRYPT_N", vaultmod.MIN_N * 2)
+    v = unlock("p" * 8, path)
+    assert v._header["n"] == vaultmod.MIN_N * 2
+    assert json.loads(path.read_text())["n"] == vaultmod.MIN_N * 2
+    # and it still unlocks with the same password
+    unlock("p" * 8, path)
+
+
+def test_change_password(tmp_path):
+    path = tmp_path / "vault.enc"
+    v = create("old-pass-1", path)
+    v.data.default_clone_base = "~/x"
+    v.save()
+    v.change_password("new-pass-2")
+
+    with pytest.raises(BadPassword):
+        unlock("old-pass-1", path)
+    v2 = unlock("new-pass-2", path)
+    assert v2.data.default_clone_base == "~/x"
+
+
+def test_legacy_vault_migration(tmp_path, monkeypatch):
+    """A pre-rename 'repotree' vault is found and migrated to the new location."""
+    new = tmp_path / "grove" / "vault.enc"
+    legacy = tmp_path / "repotree" / "vault.enc"
+    monkeypatch.setattr(vaultmod, "DEFAULT_VAULT_PATH", new)
+    monkeypatch.setattr(vaultmod, "LEGACY_VAULT_PATH", legacy)
+    monkeypatch.delenv("GROVE_VAULT", raising=False)
+
+    v = create("pw-123456", legacy)
+    v.data.default_clone_base = "~/legacy"
+    v.save()
+
+    # default lookup finds the legacy vault even though the new one is absent
+    assert vault_exists()
+    assert not new.exists()
+
+    # unlocking via the default path reads legacy AND migrates it forward
+    v2 = unlock("pw-123456")
+    assert v2.data.default_clone_base == "~/legacy"
+    assert v2.path == new
+    assert new.exists()
+    assert legacy.exists()  # original kept as a backup
+
+    # subsequent unlock now reads the migrated (new) vault
+    v3 = unlock("pw-123456")
+    assert v3.path == new
+    assert v3.data.default_clone_base == "~/legacy"
+
+
+def test_no_legacy_fallback_with_env_override(tmp_path, monkeypatch):
+    """With GROVE_VAULT set, the legacy vault must NOT be picked up."""
+    explicit = tmp_path / "explicit.enc"
+    legacy = tmp_path / "repotree" / "vault.enc"
+    monkeypatch.setattr(vaultmod, "DEFAULT_VAULT_PATH", explicit)
+    monkeypatch.setattr(vaultmod, "LEGACY_VAULT_PATH", legacy)
+    monkeypatch.setenv("GROVE_VAULT", str(explicit))
+    create("pw-123456", legacy)
+    assert not vault_exists()  # env override disables legacy fallback
+
+
 def test_config_from_workspace(tmp_path):
     v = create("p", tmp_path / "vault.enc")
     v.data.default_clone_base = "/tmp/base"

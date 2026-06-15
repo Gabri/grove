@@ -6,6 +6,10 @@ from rich.text import Text
 
 from .models import NodeKind, NodeState, UnifiedNode
 
+# Branches on these names are "normal" (grey badge); any other branch gets a
+# distinct colour so non-default checkouts are immediately visible.
+DEFAULT_BRANCHES = {"main", "master"}
+
 STATE_STYLE: dict[NodeState, str] = {
     NodeState.SYNCED: "green",
     NodeState.OUT_OF_SYNC: "yellow",
@@ -39,7 +43,8 @@ def repo_label(node: UnifiedNode) -> Text:
 
     st = node.status
     if st and st.branch:
-        label.append(f"  [{st.branch}]", style="dim")
+        branch_style = "dim" if st.branch in DEFAULT_BRANCHES else "bold yellow"
+        label.append(f"  [{st.branch}]", style=branch_style)
 
     if node.is_new and node.state is NodeState.MISSING_LOCAL:
         label.append("  NEW", style="bold magenta reverse")

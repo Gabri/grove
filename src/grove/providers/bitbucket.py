@@ -88,13 +88,9 @@ class BitbucketProvider(Provider):
         for c in clones:
             if c.get("name") == want:
                 href = c.get("href", "")
-                if want == "https" and self.root.user:
-                    # strip any embedded user, inject app-password auth
-                    href = href.split("@", 1)[-1]
-                    href = href.replace(
-                        "https://",
-                        f"https://{self.root.user}:{self.root.token}@",
-                        1,
-                    ) if href.startswith("https://") else f"https://{self.root.user}:{self.root.token}@{href}"
+                if want == "https" and "@" in href:
+                    # strip any embedded user; auth goes through GIT_ASKPASS
+                    rest = href.split("@", 1)[-1]
+                    href = f"https://{rest}"
                 return href
         return clones[0].get("href") if clones else None

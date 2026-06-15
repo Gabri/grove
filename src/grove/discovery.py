@@ -7,39 +7,64 @@ it lives under `clone_base` — not only at the canonical mirrored path.
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import git_ops
 from .config import Config
 from .models import NodeKind, NodeState, RemoteNode, UnifiedNode
 from .providers import make_provider
-from .state import repo_key
+from .state import legacy_repo_key, repo_key
+
+_MAX_WORKERS = 8
 
 
 def discover_remote(config: Config) -> list[RemoteNode]:
-    """Walk every configured root. Returns one RemoteNode per root."""
-    roots: list[RemoteNode] = []
-    for root_spec in config.roots:
-        provider = make_provider(root_spec, use_ssh=config.use_ssh)
-        roots.append(provider.discover())
-    return roots
+    """Walk every configured root (in parallel). Returns one RemoteNode per root."""
+    providers = [
+        make_provider(root_spec, use_ssh=config.use_ssh)
+        for root_spec in config.roots
+    ]
+    if len(providers) == 1:
+        return [providers[0].discover()]
+    with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(providers))) as ex:
+        return list(ex.map(lambda p: p.discover(), providers))
 
 
-def _canonical_path(config: Config, provider: str, rel_path: str) -> Path:
-    """Where a NEW clone of this repo would go (mirrors the remote hierarchy)."""
-    return config.clone_base / rel_path
+def _canonical_path(config: Config, rel_path: str, root_prefix: str = "") -> Path:
+    """Where a NEW clone of this repo would go.
+
+    Strips root_prefix so clone_base maps to the root group directly — e.g. with
+    clone_base=~/ws/internals and root_prefix="internals", repo "internals/sub/r"
+    lands at ~/ws/internals/sub/r, not ~/ws/internals/internals/sub/r.
+    """
+    if root_prefix and (
+        rel_path == root_prefix or rel_path.startswith(root_prefix + "/")
+    ):
+        rel_path = rel_path[len(root_prefix) :].lstrip("/")
+    return config.clone_base / rel_path if rel_path else config.clone_base
 
 
 def _scan_local_repos(base: Path) -> dict[str, Path]:
-    """Map normalised origin URL -> local repo dir for every clone under base."""
+    """Map normalised origin URL -> local repo dir for every clone under base.
+
+    Uses os.walk with pruning: once a repo is found we don't descend into it,
+    so vendored checkouts (node_modules, .terraform, …) are skipped cheaply.
+    """
     index: dict[str, Path] = {}
     if not base.exists():
         return index
-    for git_dir in base.rglob(".git"):
-        repo_dir = git_dir.parent.resolve()
-        norm = git_ops.normalize_remote_url(git_ops.get_origin_url(repo_dir))
-        if norm and norm not in index:
-            index[norm] = repo_dir
+    for dirpath, dirnames, filenames in os.walk(base):
+        if ".git" in dirnames or ".git" in filenames:  # worktrees use a .git file
+            repo_dir = Path(dirpath).resolve()
+            norm = git_ops.normalize_remote_url(git_ops.get_origin_url(repo_dir))
+            if norm and norm not in index:
+                index[norm] = repo_dir
+            dirnames.clear()  # don't descend into the repo
+            continue
+        # never walk into raw .git dirs encountered some other way
+        dirnames[:] = [d for d in dirnames if d != ".git"]
     return index
 
 
@@ -53,17 +78,34 @@ def build_unified(
 ) -> UnifiedNode:
     """Build the unified tree. If inspect, compute git status for cloned repos.
 
-    `known_repos` (provider/path keys seen previously) drives the NEW badge.
+    `known_repos` (repo keys seen previously) drives the NEW badge.
     """
     known = known_repos or set()
     local_index = _scan_local_repos(config.clone_base)
     matched: set[Path] = set()
 
     forest = UnifiedNode(kind=NodeKind.GROUP, name="grove", path="", provider="")
+    pending: list[UnifiedNode] = []  # cloned repos awaiting status inspection
     for remote in remote_roots:
         forest.children.append(
-            _convert(config, remote, known, local_index, matched, inspect, do_fetch)
+            _convert(config, remote, known, local_index, matched, pending,
+                     root_prefix=remote.path)
         )
+
+    if inspect and pending:
+
+        def _inspect(u: UnifiedNode) -> None:
+            status = git_ops.sync_status(u.local_path, do_fetch=do_fetch)
+            u.status = status
+            if status.error:
+                u.state = NodeState.ERROR
+            elif status.is_synced:
+                u.state = NodeState.SYNCED
+            else:
+                u.state = NodeState.OUT_OF_SYNC
+
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as ex:
+            list(ex.map(_inspect, pending))
 
     _attach_local_only(forest, local_index, matched)
     return forest
@@ -75,8 +117,8 @@ def _convert(
     known: set[str],
     local_index: dict[str, Path],
     matched: set[Path],
-    inspect: bool,
-    do_fetch: bool,
+    pending: list[UnifiedNode],
+    root_prefix: str = "",
 ) -> UnifiedNode:
     if node.kind is NodeKind.REPO:
         norm = git_ops.normalize_remote_url(node.clone_url)
@@ -85,7 +127,12 @@ def _convert(
             local_path = existing
             matched.add(existing)
         else:
-            local_path = _canonical_path(config, node.provider, node.path)
+            local_path = _canonical_path(config, node.path, root_prefix)
+        is_new = False
+        if known:
+            key = repo_key(node.provider, node.path, node.clone_url)
+            legacy = legacy_repo_key(node.provider, node.path)
+            is_new = key not in known and legacy not in known
         u = UnifiedNode(
             kind=NodeKind.REPO,
             name=node.name,
@@ -94,9 +141,12 @@ def _convert(
             local_path=local_path,
             clone_url=node.clone_url,
             web_url=node.web_url,
-            is_new=repo_key(node.provider, node.path) not in known if known else False,
+            is_new=is_new,
         )
-        _set_repo_state(u, inspect, do_fetch)
+        if u.local_path is not None and git_ops.is_git_repo(u.local_path):
+            pending.append(u)  # status computed later (possibly in parallel)
+        else:
+            u.state = NodeState.MISSING_LOCAL
         return u
 
     u = UnifiedNode(
@@ -108,28 +158,9 @@ def _convert(
     )
     for child in node.children:
         u.children.append(
-            _convert(
-                config, child, known, local_index, matched, inspect, do_fetch
-            )
+            _convert(config, child, known, local_index, matched, pending, root_prefix)
         )
     return u
-
-
-def _set_repo_state(u: UnifiedNode, inspect: bool, do_fetch: bool) -> None:
-    if u.local_path is None or not git_ops.is_git_repo(u.local_path):
-        u.state = NodeState.MISSING_LOCAL
-        return
-    if not inspect:
-        u.state = NodeState.UNKNOWN
-        return
-    status = git_ops.sync_status(u.local_path, do_fetch=do_fetch)
-    u.status = status
-    if status.error:
-        u.state = NodeState.ERROR
-    elif status.is_synced:
-        u.state = NodeState.SYNCED
-    else:
-        u.state = NodeState.OUT_OF_SYNC
 
 
 def _attach_local_only(
@@ -166,5 +197,5 @@ def current_repo_keys(remote_roots: list[RemoteNode]) -> set[str]:
     keys: set[str] = set()
     for root in remote_roots:
         for repo in root.iter_repos():
-            keys.add(repo_key(repo.provider, repo.path))
+            keys.add(repo_key(repo.provider, repo.path, repo.clone_url))
     return keys

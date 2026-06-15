@@ -63,10 +63,12 @@ class GitLabProvider(Provider):
 
     def _project_node(self, proj: dict, parent_path: str) -> RemoteNode:
         rpath = f"{parent_path}/{proj['path']}".strip("/")
+        # clone URLs are credential-free: auth is injected per-command via
+        # GIT_ASKPASS (see git_ops) so tokens never land in .git/config
         url = (
             proj.get("ssh_url_to_repo")
             if self.use_ssh
-            else self._http_with_token(proj.get("http_url_to_repo", ""))
+            else proj.get("http_url_to_repo")
         )
         return RemoteNode(
             kind=NodeKind.REPO,
@@ -75,12 +77,4 @@ class GitLabProvider(Provider):
             provider=self.name,
             clone_url=url,
             web_url=proj.get("web_url"),
-        )
-
-    def _http_with_token(self, http_url: str) -> str:
-        token = self.root.token
-        if not token or not http_url.startswith("https://"):
-            return http_url
-        return http_url.replace(
-            "https://", f"https://oauth2:{token}@", 1
         )

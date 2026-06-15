@@ -96,3 +96,51 @@ def test_behind_then_update(repo_pair):
     git_ops.update(clone)
     st2 = git_ops.sync_status(clone)
     assert st2.is_synced
+
+
+def _git_out(args, cwd) -> str:
+    out = subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    )
+    return out.stdout.strip()
+
+
+def test_update_via_fetch_url(repo_pair):
+    """update(fetch_url=...) bypasses the configured remote entirely."""
+    origin, work, clone = repo_pair
+    (work / "c.txt").write_text("3\n")
+    _git(["add", "."], work)
+    _git(["commit", "-m", "third"], work)
+    _git(["push"], work)
+    # break the configured origin to prove fetch_url is what's used
+    _git(["remote", "set-url", "origin", "git@invalid.example:nope.git"], clone)
+
+    git_ops.update(clone, fetch_url=str(origin))
+    assert _git_out(["rev-parse", "HEAD"], work) == _git_out(
+        ["rev-parse", "HEAD"], clone
+    )
+
+
+def test_update_no_upstream_falls_back(repo_pair):
+    """A clone whose branch has no tracking info still ff-updates."""
+    origin, work, clone = repo_pair
+    (work / "d.txt").write_text("4\n")
+    _git(["add", "."], work)
+    _git(["commit", "-m", "fourth"], work)
+    _git(["push"], work)
+    _git(["branch", "--unset-upstream"], clone)
+
+    git_ops.update(clone)
+    st = git_ops.sync_status(clone)
+    assert st.is_synced  # upstream restored + fast-forwarded
+
+
+def test_scrub_secrets():
+    s = git_ops.scrub_secrets
+    assert (
+        s("fatal: https://oauth2:glpat-abc123@gitlab.com/x.git failed")
+        == "fatal: https://oauth2:***@gitlab.com/x.git failed"
+    )
+    assert ":sekrit@" not in s("https://x-access-token:sekrit@github.com/a/b")
+    # URLs without credentials pass through untouched
+    assert s("https://gitlab.com/x.git") == "https://gitlab.com/x.git"

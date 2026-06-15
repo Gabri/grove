@@ -44,11 +44,8 @@ class GitHubProvider(Provider):
 
     def _repo_node(self, repo: dict, parent_path: str) -> RemoteNode:
         rpath = f"{parent_path}/{repo['name']}"
-        url = (
-            repo.get("ssh_url")
-            if self.use_ssh
-            else self._http_with_token(repo.get("clone_url", ""))
-        )
+        # clone URLs are credential-free; auth goes through GIT_ASKPASS
+        url = repo.get("ssh_url") if self.use_ssh else repo.get("clone_url")
         return RemoteNode(
             kind=NodeKind.REPO,
             name=repo["name"],
@@ -57,9 +54,3 @@ class GitHubProvider(Provider):
             clone_url=url,
             web_url=repo.get("html_url"),
         )
-
-    def _http_with_token(self, clone_url: str) -> str:
-        token = self.root.token
-        if not token or not clone_url.startswith("https://"):
-            return clone_url
-        return clone_url.replace("https://", f"https://x-access-token:{token}@", 1)

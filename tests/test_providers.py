@@ -37,9 +37,10 @@ def test_github_org_flat(tmp_path):
     repos = list(node.iter_repos())
     assert {r.name for r in repos} == {"repo-a", "repo-b"}
     assert all(r.kind is NodeKind.REPO for r in repos)
-    # token injected into https url
+    # clone URL stays credential-free (auth is per-command via GIT_ASKPASS)
     a = next(r for r in repos if r.name == "repo-a")
-    assert "x-access-token:t@" in a.clone_url
+    assert a.clone_url == "https://github.com/acme/repo-a.git"
+    assert "t@" not in a.clone_url
     assert a.path == "acme/repo-a"
 
 
@@ -109,4 +110,5 @@ def test_gitlab_nested_groups():
     paths = {r.path for r in node.iter_repos()}
     assert paths == {"top/p1", "top/sub/p2"}
     p1 = next(r for r in node.iter_repos() if r.name == "p1")
-    assert "oauth2:t@" in p1.clone_url
+    # credential-free URL: token must never be embedded
+    assert p1.clone_url == "https://gl.test/top/p1.git"

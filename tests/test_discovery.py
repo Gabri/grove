@@ -100,3 +100,43 @@ def test_local_only(tmp_path):
         r for r in forest.iter_repos() if r.state is NodeState.LOCAL_ONLY
     ]
     assert any(r.name == "stray" for r in local_only)
+
+
+def test_canonical_path_strips_root_prefix(tmp_path):
+    """New clone paths strip the root group prefix to avoid double folders."""
+    from grove.discovery import _canonical_path
+
+    cfg = _config(tmp_path)
+    # repo "grp/sub/r2" under root "grp" → clone_base/sub/r2, NOT clone_base/grp/sub/r2
+    assert _canonical_path(cfg, "grp/sub/r2", "grp") == cfg.clone_base / "sub" / "r2"
+    assert _canonical_path(cfg, "grp/r1", "grp") == cfg.clone_base / "r1"
+    # root itself (edge case): maps to clone_base
+    assert _canonical_path(cfg, "grp", "grp") == cfg.clone_base
+    # no prefix: unchanged (backward compat)
+    assert _canonical_path(cfg, "grp/r1", "") == cfg.clone_base / "grp" / "r1"
+
+
+def test_missing_local_canonical_strips_root(tmp_path):
+    """build_unified: new-clone local_path strips the root prefix."""
+    cfg = _config(tmp_path)
+    forest = build_unified(cfg, [_remote_root()], inspect=True)
+    by_path = {r.path: r for r in forest.iter_repos()}
+    # canonical paths have "grp" stripped
+    assert by_path["grp/r1"].local_path == cfg.clone_base / "r1"
+    assert by_path["grp/sub/r2"].local_path == cfg.clone_base / "sub" / "r2"
+
+
+def test_scan_prunes_nested_repos(tmp_path):
+    """Vendored checkouts inside a repo are not indexed (walk is pruned)."""
+    from grove.discovery import _scan_local_repos
+
+    cfg = _config(tmp_path)
+    _make_repo(cfg.clone_base / "outer", origin="https://h/outer.git")
+    # nested clone inside the outer repo (e.g. vendored module)
+    _make_repo(
+        cfg.clone_base / "outer" / "vendor" / "inner",
+        origin="https://h/inner.git",
+    )
+    index = _scan_local_repos(cfg.clone_base)
+    assert "h/outer" in index
+    assert "h/inner" not in index  # pruned, never visited

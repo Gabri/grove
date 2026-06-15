@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import webbrowser
 from pathlib import Path
 
 from textual import work
@@ -15,6 +16,8 @@ from .config import Config, ConfigError, config_from_workspace
 from .discovery import build_unified, current_repo_keys, discover_remote
 from .models import NodeKind, NodeState, UnifiedNode
 from .screens import (
+    BranchSelectScreen,
+    ChoiceScreen,
     ConfirmScreen,
     CreateVaultScreen,
     TextPromptScreen,
@@ -23,6 +26,9 @@ from .screens import (
 )
 from .vault import BadPassword, Vault, VaultError, create, unlock, vault_exists
 from .widgets import LEGEND, node_label
+
+# username git expects for token auth, per provider
+_TOKEN_USER = {"gitlab": "oauth2", "github": "x-access-token"}
 
 
 class GroveApp(App):
@@ -33,8 +39,9 @@ class GroveApp(App):
     #log { height: 8; border: round $secondary; }
     #legend { height: 1; padding: 0 1; color: $text-muted; }
 
-    ConfirmScreen, CreateVaultScreen, UnlockScreen,
-    WorkspaceManagerScreen, WorkspaceFormScreen, CredentialFormScreen {
+    ConfirmScreen, ChoiceScreen, CreateVaultScreen, UnlockScreen,
+    WorkspaceManagerScreen, WorkspaceFormScreen, CredentialFormScreen,
+    BranchSelectScreen {
         align: center middle;
     }
     #confirm-box, #form-box {
@@ -68,6 +75,10 @@ class GroveApp(App):
         ("c", "clone", "Clone"),
         ("u", "update", "Update"),
         ("U", "update_all", "Update all"),
+        ("slash", "filter", "Filter"),
+        ("B", "checkout_branch", "Branch"),
+        ("o", "open_web", "Open in browser"),
+        ("P", "change_password", "Change password"),
         ("q", "quit", "Quit"),
     ]
 
@@ -77,6 +88,7 @@ class GroveApp(App):
         self.vault: Vault | None = None
         self.config: Config | None = None
         self.forest: UnifiedNode | None = None
+        self._filter: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -97,7 +109,7 @@ class GroveApp(App):
     # ---- logging / status ---------------------------------------------
     def log_msg(self, msg: str) -> None:
         log = self.query_one("#log", Log)
-        for line in str(msg).split("\n"):
+        for line in git_ops.scrub_secrets(str(msg)).split("\n"):
             log.write_line(line)
 
     def _set_loading(self, value: bool) -> None:
@@ -106,6 +118,19 @@ class GroveApp(App):
     def _clone_base_for(self, ws) -> str:
         assert self.vault is not None
         return ws.clone_base or self.vault.data.default_clone_base
+
+    def _auth_for(self, provider: str) -> git_ops.GitAuth | None:
+        """(username, token) for HTTPS git auth from the active workspace key."""
+        if self.vault is None:
+            return None
+        ws = self.vault.data.active()
+        if ws is None:
+            return None
+        cred = next((p for p in ws.providers if p.provider == provider), None)
+        if cred is None or not cred.token:
+            return None
+        user = _TOKEN_USER.get(provider) or cred.user or "git"
+        return (user, cred.token)
 
     def _update_status(self) -> None:
         bar = self.query_one("#status", Static)
@@ -120,9 +145,10 @@ class GroveApp(App):
             f"[cyan]{p.provider}[/]:[bold]{p.label}[/]" for p in ws.providers
         ) or "[yellow](no keys — press 'w' then 'a')[/]"
         base = self._clone_base_for(ws)
+        filt = f"   [magenta]filter: {self._filter}[/]" if self._filter else ""
         bar.update(
             f"workspace [bold green]{ws.name}[/]   {providers}"
-            f"   [dim]↧ {base}[/]"
+            f"   [dim]↧ {base}[/]{filt}"
         )
         self.sub_title = f"{ws.name} → {base}"
 
@@ -196,8 +222,8 @@ class GroveApp(App):
 
         def done(switched: str | None) -> None:
             self._update_status()
-            # re-activate whenever the manager closes (handles switch + edits)
-            if self.vault and self.vault.data.active() is not None:
+            # only re-discover if something changed in (or that affects) the active ws
+            if switched is not None and self.vault and self.vault.data.active() is not None:
                 self._activate_current()
 
         self.push_screen(WorkspaceManagerScreen(self.vault), done)
@@ -230,7 +256,88 @@ class GroveApp(App):
             done,
         )
 
+    def action_change_password(self) -> None:
+        if self.vault is None:
+            return
+
+        def done(password: str | None) -> None:
+            if password is None:
+                return
+            assert self.vault is not None
+            self.vault.change_password(password)
+            self.log_msg("Master password changed.")
+
+        self.push_screen(
+            CreateVaultScreen("Change master password", "Change"), done
+        )
+
+    # ---- filter / open --------------------------------------------------
+    def action_filter(self) -> None:
+        def done(value: str | None) -> None:
+            if value is None:
+                return
+            self._filter = value.strip().lower()
+            self._update_status()
+            self._rebuild_tree()
+
+        self.push_screen(
+            TextPromptScreen(
+                "Filter tree",
+                "Show only repos whose name/path contains this text "
+                "(empty = clear filter).",
+                self._filter,
+            ),
+            done,
+        )
+
+    def action_open_web(self) -> None:
+        node = self._selected()
+        if node is None or not node.web_url:
+            self.log_msg("No web URL for selection.")
+            return
+        webbrowser.open(node.web_url)
+        self.log_msg(f"Opened {node.web_url}")
+
+    def action_checkout_branch(self) -> None:
+        node = self._selected()
+        if node is None or node.kind is not NodeKind.REPO:
+            self.log_msg("Select a repo first.")
+            return
+        if node.local_path is None or not git_ops.is_git_repo(node.local_path):
+            self.log_msg("Repo not cloned locally — clone it first.")
+            return
+        branches = git_ops.list_branches(node.local_path)
+        if not branches:
+            self.log_msg("No branches found.")
+            return
+        current = node.status.branch if node.status else None
+
+        def done(branch: str | None) -> None:
+            if branch is None or branch == current:
+                return
+            try:
+                git_ops.checkout(node.local_path, branch)
+            except git_ops.GitError as e:
+                self.log_msg(f"checkout failed: {e}")
+                return
+            node.status = git_ops.sync_status(node.local_path)
+            node.state = self._state_from_status(node.status)
+            self._rebuild_tree(keep_cursor=node.path)
+            self.log_msg(f"Switched {node.name} → {branch}")
+
+        self.push_screen(BranchSelectScreen(branches, current), done)
+
     # ---- tree building -------------------------------------------------
+    def _node_visible(self, node: UnifiedNode) -> bool:
+        if not self._filter:
+            return True
+        if node.kind is NodeKind.REPO:
+            return (
+                self._filter in node.name.lower()
+                or self._filter in node.path.lower()
+            )
+        return any(self._node_visible(c) for c in node.children)
+
     def _collect_expanded(self, node: TreeNode, out: set[str]) -> None:
         if node.data is not None and node.is_expanded:
             out.add(node.data.path)
@@ -243,20 +350,58 @@ class GroveApp(App):
         for child in node.children:
             self._apply_expanded(child, paths)
 
-    def _rebuild_tree(self) -> None:
+    def _collect_cursor(self) -> str | None:
+        tree = self.query_one("#tree", Tree)
+        cur = tree.cursor_node
+        return cur.data.path if (cur and cur.data) else None
+
+    def _restore_cursor(self, node: TreeNode, path: str) -> bool:
+        if node.data is not None and node.data.path == path:
+            self.query_one("#tree", Tree).move_cursor(node)
+            return True
+        for child in node.children:
+            if self._restore_cursor(child, path):
+                return True
+        return False
+
+    def _rebuild_tree(self, keep_cursor: str | None = None) -> None:
         tree = self.query_one("#tree", Tree)
         expanded: set[str] = set()
         self._collect_expanded(tree.root, expanded)
+        cursor_path = keep_cursor if keep_cursor is not None else self._collect_cursor()
         tree.clear()
         if self.forest is None:
             return
-        for child in self.forest.children:
-            self._add_node(tree.root, child)
-        if expanded:
+
+        real_roots = [c for c in self.forest.children if c.path != "__local_only__"]
+        local_only = [c for c in self.forest.children if c.path == "__local_only__"]
+
+        if len(real_roots) == 1:
+            # Single root: flatten it — children appear at tree top, root is in status bar
+            for child in real_roots[0].children:
+                if self._node_visible(child):
+                    self._add_node(tree.root, child)
+        else:
+            for child in real_roots:
+                if self._node_visible(child):
+                    self._add_node(tree.root, child)
+
+        for node in local_only:
+            if self._node_visible(node):
+                self._add_node(tree.root, node)
+
+        if self._filter:
+            tree.root.expand_all()  # filtered view: show everything that matched
+        elif expanded:
             self._apply_expanded(tree.root, expanded)
         else:
             tree.root.expand_all()
+
         tree.focus()
+        # Defer cursor restore: expand_all() posts async messages; moving the
+        # cursor before those are processed drops it to line 0.
+        if cursor_path:
+            self.call_after_refresh(self._restore_cursor, tree.root, cursor_path)
 
     def _add_node(self, parent: TreeNode, node: UnifiedNode) -> None:
         if node.kind is NodeKind.REPO:
@@ -264,7 +409,8 @@ class GroveApp(App):
         else:
             tn = parent.add(node_label(node), data=node)
             for child in node.children:
-                self._add_node(tn, child)
+                if self._node_visible(child):
+                    self._add_node(tn, child)
 
     def _selected(self) -> UnifiedNode | None:
         tree = self.query_one("#tree", Tree)
@@ -329,6 +475,8 @@ class GroveApp(App):
 
     @work(thread=True, exclusive=True)
     def _fetch_worker(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
         assert self.forest is not None
         try:
             repos = [
@@ -336,13 +484,25 @@ class GroveApp(App):
                 for r in self.forest.iter_repos()
                 if r.local_path and git_ops.is_git_repo(r.local_path)
             ]
-            for i, repo in enumerate(repos, 1):
-                st = git_ops.sync_status(repo.local_path, do_fetch=True)
+            done = 0
+
+            def _one(repo: UnifiedNode) -> None:
+                nonlocal done
+                st = git_ops.sync_status(
+                    repo.local_path,
+                    do_fetch=True,
+                    fetch_url=repo.clone_url,
+                    auth=self._auth_for(repo.provider),
+                )
                 repo.status = st
                 repo.state = self._state_from_status(st)
+                done += 1
                 self.call_from_thread(
-                    self.log_msg, f"  [{i}/{len(repos)}] {repo.path}"
+                    self.log_msg, f"  [{done}/{len(repos)}] {repo.path}"
                 )
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(_one, repos))
             self.call_from_thread(self._rebuild_tree)
             self.call_from_thread(self.log_msg, "Status fetch done.")
         finally:
@@ -367,44 +527,79 @@ class GroveApp(App):
             self.log_msg("Nothing to clone in selection.")
             return
 
-        def go(confirmed: bool) -> None:
-            if confirmed:
-                self._clone_worker(targets)
+        def go(choice: str | None) -> None:
+            if choice is None:
+                return
+            depth = 1 if choice == "shallow" else None
+            self._bulk_worker([], targets, depth=depth)
 
         self.push_screen(
-            ConfirmScreen(
+            ChoiceScreen(
                 "Clone repos",
                 f"Clone {len(targets)} repo(s) into {self.config.clone_base}?",
-                "Clone",
+                [("full", "Clone"), ("shallow", "Shallow (depth 1)")],
             ),
             go,
         )
-
-    @work(thread=True)
-    def _clone_worker(self, targets: list[UnifiedNode]) -> None:
-        for i, repo in enumerate(targets, 1):
-            self.call_from_thread(
-                self.log_msg, f"  [{i}/{len(targets)}] cloning {repo.path}…"
-            )
-            try:
-                git_ops.clone(repo.clone_url, repo.local_path)
-                repo.status = git_ops.sync_status(repo.local_path)
-                repo.state = self._state_from_status(repo.status)
-            except Exception as e:  # noqa: BLE001
-                repo.state = NodeState.ERROR
-                self.call_from_thread(self.log_msg, f"    ERROR: {e}")
-        self.call_from_thread(self._rebuild_tree)
-        self.call_from_thread(self.log_msg, "Clone done.")
 
     def action_update(self) -> None:
         node = self._selected()
         if node is None:
             return
         targets = self._updatable(node)
-        if not targets:
+        dirty = [
+            r for r in node.iter_repos()
+            if r.state is NodeState.OUT_OF_SYNC
+            and r.local_path
+            and r.status
+            and r.status.dirty
+            and r.status.behind > 0
+        ]
+        if not targets and not dirty:
             self.log_msg("Nothing to update in selection.")
             return
-        self._update_worker(targets)
+        if not dirty:
+            self._bulk_worker(targets, [])
+            return
+
+        # Some repos have uncommitted changes — ask what to do
+        names = "\n".join(f"  • {r.name}" for r in dirty)
+        body = f"{'These repos have' if len(dirty) > 1 else 'This repo has'} uncommitted changes:\n{names}\n\nStash them and pull?"
+        choices: list[tuple[str, str]] = [("stash_pull", "Stash & pull")]
+        if targets:
+            choices.append(("skip_dirty", f"Skip dirty, pull {len(targets)} clean"))
+
+        def on_choice(choice: str | None) -> None:
+            if choice == "stash_pull":
+                self._stash_and_update_worker(dirty, targets)
+            elif choice == "skip_dirty":
+                self._bulk_worker(targets, [])
+
+        self.push_screen(ChoiceScreen("Uncommitted changes", body, choices), on_choice)
+
+    @work(thread=True)
+    def _stash_and_update_worker(
+        self, dirty: list[UnifiedNode], clean: list[UnifiedNode]
+    ) -> None:
+        stashed: list[UnifiedNode] = []
+        for repo in dirty:
+            try:
+                git_ops.stash(repo.local_path)
+                self.call_from_thread(self.log_msg, f"  stashed {repo.name}")
+                stashed.append(repo)
+            except git_ops.GitError as e:
+                self.call_from_thread(self.log_msg, f"  stash failed {repo.name}: {e}")
+        # Refresh status so these repos pass _updatable checks
+        for repo in stashed:
+            st = git_ops.sync_status(repo.local_path)
+            repo.status = st
+            repo.state = self._state_from_status(st)
+        combined = stashed + clean
+        if combined:
+            self.call_from_thread(self._bulk_worker, combined, [])
+        else:
+            self.call_from_thread(self.log_msg, "Nothing to update after stash.")
+            self.call_from_thread(self._rebuild_tree)
 
     def action_update_all(self) -> None:
         scope = self._selected() or self.forest
@@ -427,12 +622,8 @@ class GroveApp(App):
             parts.append(f"clone {len(to_clone)} missing repo(s)")
 
         def go(confirmed: bool) -> None:
-            if not confirmed:
-                return
-            if to_update:
-                self._update_worker(to_update)
-            if to_clone:
-                self._clone_worker(to_clone)
+            if confirmed:
+                self._bulk_worker(to_update, to_clone)
 
         self.push_screen(
             ConfirmScreen(
@@ -456,33 +647,43 @@ class GroveApp(App):
         ]
 
     @work(thread=True)
-    def _update_worker(self, targets: list[UnifiedNode]) -> None:
-        for i, repo in enumerate(targets, 1):
+    def _bulk_worker(
+        self,
+        to_update: list[UnifiedNode],
+        to_clone: list[UnifiedNode],
+        depth: int | None = None,
+    ) -> None:
+        """Update then clone, sequentially, with a single tree rebuild at the end."""
+        total = len(to_update) + len(to_clone)
+        step = 0
+        for repo in to_update:
+            step += 1
             self.call_from_thread(
-                self.log_msg, f"  [{i}/{len(targets)}] pull {repo.path}…"
+                self.log_msg, f"  [{step}/{total}] pull {repo.path}…"
             )
+            auth = self._auth_for(repo.provider)
             try:
-                git_ops.update(repo.local_path, fetch_url=repo.clone_url)
+                git_ops.update(repo.local_path, fetch_url=repo.clone_url, auth=auth)
                 repo.status = git_ops.sync_status(repo.local_path)
-                # Repos updated via token URL have no tracking branch → sync_status
-                # reports no-upstream even though the merge succeeded. If clean and
-                # even (behind=0, ahead=0), trust the merge and mark green.
-                if (
-                    repo.clone_url
-                    and not repo.status.has_upstream
-                    and not repo.status.error
-                    and not repo.status.dirty
-                    and repo.status.behind == 0
-                    and repo.status.ahead == 0
-                ):
-                    repo.state = NodeState.SYNCED
-                else:
-                    repo.state = self._state_from_status(repo.status)
+                repo.state = self._state_from_status(repo.status)
+            except Exception as e:  # noqa: BLE001
+                repo.state = NodeState.ERROR
+                self.call_from_thread(self.log_msg, f"    ERROR: {e}")
+        for repo in to_clone:
+            step += 1
+            self.call_from_thread(
+                self.log_msg, f"  [{step}/{total}] cloning {repo.path}…"
+            )
+            auth = self._auth_for(repo.provider)
+            try:
+                git_ops.clone(repo.clone_url, repo.local_path, auth=auth, depth=depth)
+                repo.status = git_ops.sync_status(repo.local_path)
+                repo.state = self._state_from_status(repo.status)
             except Exception as e:  # noqa: BLE001
                 repo.state = NodeState.ERROR
                 self.call_from_thread(self.log_msg, f"    ERROR: {e}")
         self.call_from_thread(self._rebuild_tree)
-        self.call_from_thread(self.log_msg, "Update done.")
+        self.call_from_thread(self.log_msg, "Done.")
 
 
 def run(vault_path: Path | None = None) -> None:
