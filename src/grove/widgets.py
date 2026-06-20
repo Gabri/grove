@@ -49,6 +49,12 @@ def repo_label(node: UnifiedNode) -> Text:
     if node.is_new and node.state is NodeState.MISSING_LOCAL:
         label.append("  NEW", style="bold magenta reverse")
 
+    if node.remote_mismatch:
+        # show the protocol the local origin IS using (the "wrong" one)
+        # clone_url reflects workspace setting; mismatch → local is the opposite
+        local_is_https = bool(node.clone_url and node.clone_url.startswith("git@"))
+        label.append("  [↔https]" if local_is_https else "  [↔ssh]", style="bold magenta")
+
     if st and node.state is NodeState.OUT_OF_SYNC:
         bits = []
         if st.behind:

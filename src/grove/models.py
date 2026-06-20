@@ -81,6 +81,7 @@ class UnifiedNode:
     state: NodeState = NodeState.UNKNOWN
     status: SyncStatus | None = None
     is_new: bool = False  # appeared on remote since last saved state
+    remote_mismatch: bool = False  # local origin protocol differs from workspace setting
     children: list[UnifiedNode] = field(default_factory=list)
 
     def iter_repos(self):
@@ -140,11 +141,15 @@ class Workspace:
     providers: list[ProviderCred] = field(default_factory=list)
     clone_base: str | None = None  # override of vault default
     known_repos: list[str] = field(default_factory=list)  # for NEW detection
+    protocol: str = "https"  # "https" | "ssh" — per-workspace override
+    ssh_key: str | None = None  # path to SSH private key; None = use agent
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "clone_base": self.clone_base,
+            "protocol": self.protocol,
+            "ssh_key": self.ssh_key,
             "providers": [p.to_dict() for p in self.providers],
             "known_repos": self.known_repos,
         }
@@ -154,6 +159,8 @@ class Workspace:
         return cls(
             name=d["name"],
             clone_base=d.get("clone_base"),
+            protocol=d.get("protocol", "https"),
+            ssh_key=d.get("ssh_key"),
             providers=[ProviderCred.from_dict(p) for p in d.get("providers", [])],
             known_repos=d.get("known_repos", []),
         )

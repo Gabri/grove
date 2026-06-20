@@ -251,9 +251,14 @@ class TextPromptScreen(ModalScreen[str | None]):
 
 
 class WorkspaceFormScreen(ModalScreen[Workspace | None]):
-    """Create or edit a workspace (name + local folder). Returns Workspace or None."""
+    """Create or edit a workspace: name, folder, protocol, and provider keys."""
 
-    BINDINGS = [("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        ("ctrl+a", "add_key", "Add key"),
+        ("ctrl+e", "edit_key", "Edit key"),
+        ("delete", "delete_key", "Remove key"),
+    ]
 
     def __init__(
         self,
@@ -263,12 +268,16 @@ class WorkspaceFormScreen(ModalScreen[Workspace | None]):
         super().__init__()
         self._existing = existing
         self._vault_default = vault_default
+        import copy as _copy
+        self._providers: list[ProviderCred] = (
+            _copy.deepcopy(existing.providers) if existing else []
+        )
 
     def compose(self) -> ComposeResult:
         ex = self._existing
         title = "Edit workspace" if ex else "New workspace"
         btn = "Save" if ex else "Create"
-        with Vertical(id="form-box"):
+        with VerticalScroll(id="form-box"):
             yield Label(title, id="form-title")
             yield Input(
                 value=ex.name if ex else "",
@@ -279,10 +288,88 @@ class WorkspaceFormScreen(ModalScreen[Workspace | None]):
                 placeholder=f"local folder — empty = vault default ({self._vault_default})",
                 id="base",
             )
+            yield Label("clone protocol:")
+            yield Select(
+                [("HTTPS (token auth)", "https"), ("SSH (key auth)", "ssh")],
+                value=(ex.protocol if ex else "https"),
+                id="protocol",
+                allow_blank=False,
+            )
+            yield Input(
+                value=ex.ssh_key or "" if ex else "",
+                placeholder="SSH private key path (e.g. ~/.ssh/id_ed25519) — empty = use agent",
+                id="ssh-key",
+            )
+            yield Label(
+                "keys:  [dim]ctrl+a=add  enter=edit  del=remove[/]",
+                markup=True,
+            )
+            yield ListView(id="keys-list")
             yield Static("", id="form-error")
             with Horizontal(id="confirm-buttons"):
                 yield Button(btn, variant="primary", id="ok")
                 yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self._refresh_keys()
+
+    def _refresh_keys(self, keep_idx: int = 0) -> None:
+        lv = self.query_one("#keys-list", ListView)
+        lv.clear()
+        if not self._providers:
+            lv.append(ListItem(Label("[dim]no keys yet — press ctrl+a to add[/]", markup=True)))
+            return
+        for p in self._providers:
+            n_roots = len(p.roots) if p.roots else 0
+            line = f"[bold]{p.provider}[/]:{p.label}"
+            if p.base_url:
+                line += f"  [dim]{p.base_url}[/]"
+            line += f"  [dim]{n_roots} root{'s' if n_roots != 1 else ''}[/]"
+            lv.append(ListItem(Label(line, markup=True)))
+        lv.index = max(0, min(keep_idx, len(self._providers) - 1))
+
+    def _selected_idx(self) -> int | None:
+        if not self._providers:
+            return None
+        lv = self.query_one("#keys-list", ListView)
+        idx = lv.index if lv.index is not None else 0
+        return idx if 0 <= idx < len(self._providers) else None
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id == "keys-list":
+            event.stop()
+            self.action_edit_key()
+
+    def action_add_key(self) -> None:
+        def done(cred: ProviderCred | None) -> None:
+            if cred is None:
+                return
+            self._providers = [p for p in self._providers if p.provider != cred.provider]
+            self._providers.append(cred)
+            self._refresh_keys()
+
+        self.app.push_screen(CredentialFormScreen(), done)
+
+    def action_edit_key(self) -> None:
+        idx = self._selected_idx()
+        if idx is None:
+            return
+        cred = self._providers[idx]
+
+        def done(updated: ProviderCred | None) -> None:
+            if updated is None:
+                return
+            self._providers[idx] = updated
+            self._refresh_keys(keep_idx=idx)
+
+        self.app.push_screen(CredentialFormScreen(existing=cred), done)
+
+    def action_delete_key(self) -> None:
+        idx = self._selected_idx()
+        if idx is None:
+            return
+        del self._providers[idx]
+        self._refresh_keys(keep_idx=max(0, idx - 1))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel":
@@ -293,7 +380,19 @@ class WorkspaceFormScreen(ModalScreen[Workspace | None]):
             self.query_one("#form-error", Static).update("[red]name required[/]")
             return
         base = self.query_one("#base", Input).value.strip() or None
-        self.dismiss(Workspace(name=name, clone_base=base))
+        protocol = str(self.query_one("#protocol", Select).value)
+        ssh_key = self.query_one("#ssh-key", Input).value.strip() or None
+        known = self._existing.known_repos if self._existing else []
+        self.dismiss(
+            Workspace(
+                name=name,
+                clone_base=base,
+                protocol=protocol,
+                ssh_key=ssh_key,
+                providers=self._providers,
+                known_repos=known,
+            )
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -466,12 +565,9 @@ class WorkspaceManagerScreen(ModalScreen[str | None]):
 
     BINDINGS = [
         ("escape", "close", "Close"),
-        ("n", "new_workspace", "New workspace"),
-        ("r", "edit_workspace", "Edit ws"),
+        ("n", "new_workspace", "New"),
+        ("e", "edit_workspace", "Edit"),
         ("c", "copy", "Copy"),
-        ("a", "add_key", "Add key"),
-        ("e", "edit_key", "Edit key"),
-        ("b", "set_base", "Set local dir"),
         ("d", "delete", "Delete"),
         ("enter", "switch", "Switch to"),
     ]
@@ -485,8 +581,7 @@ class WorkspaceManagerScreen(ModalScreen[str | None]):
         with Vertical(id="ws-box"):
             yield Label("Workspaces", id="form-title")
             yield Static(
-                "[dim]enter=switch  n=new  r=edit  c=copy  a=add key  e=edit key  "
-                "b=local dir  d=delete  esc=close[/]",
+                "[dim]enter=switch  n=new  e=edit  c=copy  d=delete  esc=close[/]",
                 id="ws-hint",
             )
             yield ListView(id="ws-list")
@@ -504,8 +599,9 @@ class WorkspaceManagerScreen(ModalScreen[str | None]):
         for ws in self.vault.data.workspaces:
             marker = "[green]●[/] " if ws.name == active else "  "
             base = ws.clone_base or default_base
+            proto = "[cyan]ssh[/]" if ws.protocol == "ssh" else "[dim]https[/]"
             label = (
-                f"{marker}{ws.name}  [dim]{ws.provider_summary()}"
+                f"{marker}{ws.name}  {proto}  [dim]{ws.provider_summary()}"
                 f"   ↧ {base}[/]"
             )
             item = ListItem(Label(label))
@@ -549,7 +645,7 @@ class WorkspaceManagerScreen(ModalScreen[str | None]):
                 self.vault.data.active_workspace = ws.name
             self.vault.save()
             self._refresh_list(highlight=ws.name)
-            self.notify(f"created workspace '{ws.name}' — press 'a' to add a key")
+            self.notify(f"created workspace '{ws.name}'")
 
         self.app.push_screen(
             WorkspaceFormScreen(vault_default=self.vault.data.default_clone_base), done
@@ -573,12 +669,17 @@ class WorkspaceManagerScreen(ModalScreen[str | None]):
                 return
             name_changed = new_name != name
             base_changed = result.clone_base != ws.clone_base
+            proto_changed = result.protocol != ws.protocol
+            keys_changed = result.providers != ws.providers
             ws.name = new_name
             ws.clone_base = result.clone_base
+            ws.protocol = result.protocol
+            ws.ssh_key = result.ssh_key
+            ws.providers = result.providers
             if self.vault.data.active_workspace == name:
                 self.vault.data.active_workspace = new_name
                 self._result = new_name
-            elif base_changed:
+            elif base_changed or proto_changed or keys_changed:
                 self._mark_config_changed(new_name)
             self.vault.save()
             self._refresh_list(highlight=new_name)
@@ -588,6 +689,10 @@ class WorkspaceManagerScreen(ModalScreen[str | None]):
             if base_changed:
                 shown = ws.clone_base or self.vault.data.default_clone_base
                 parts.append(f"folder → {shown}")
+            if proto_changed:
+                parts.append(f"protocol → {ws.protocol}")
+            if keys_changed:
+                parts.append("keys updated")
             self.notify(", ".join(parts) if parts else f"'{name}' unchanged")
 
         self.app.push_screen(
@@ -627,117 +732,17 @@ class WorkspaceManagerScreen(ModalScreen[str | None]):
                 return
             ws_copy.name = result.name
             ws_copy.clone_base = result.clone_base
+            ws_copy.protocol = result.protocol
+            ws_copy.ssh_key = result.ssh_key
+            ws_copy.providers = result.providers
             self.vault.data.workspaces.append(ws_copy)
             self.vault.save()
             self._refresh_list(highlight=ws_copy.name)
             self.notify(f"copied '{name}' → '{ws_copy.name}'")
-            # auto-open key editing so user can update credentials
-            if ws_copy.providers:
-                self._pick_and_edit_key(ws_copy.name)
 
         self.app.push_screen(
             WorkspaceFormScreen(
                 existing=ws_copy, vault_default=self.vault.data.default_clone_base
-            ),
-            done,
-        )
-
-    def action_add_key(self) -> None:
-        name = self._selected_name()
-        if name is None:
-            self.notify("select a workspace first", severity="warning")
-            return
-        ws = self.vault.data.get_workspace(name)
-
-        def done(cred: ProviderCred | None) -> None:
-            if cred is None or ws is None:
-                return
-            existing = next(
-                (p for p in ws.providers if p.provider == cred.provider), None
-            )
-            verb = "added"
-            if existing is not None:
-                ws.providers.remove(existing)
-                verb = "replaced"
-            ws.providers.append(cred)
-            self.vault.save()
-            self._mark_config_changed(name)
-            self._refresh_list(highlight=name)
-            self.notify(f"{verb} {cred.provider}:{cred.label} on '{name}'")
-
-        self.app.push_screen(CredentialFormScreen(), done)
-
-    def _open_edit_key(self, ws_name: str, cred: ProviderCred) -> None:
-        ws = self.vault.data.get_workspace(ws_name)
-
-        def done(updated: ProviderCred | None) -> None:
-            if updated is None or ws is None:
-                return
-            ws.providers = [p for p in ws.providers if p is not cred]
-            ws.providers.append(updated)
-            self.vault.save()
-            self._mark_config_changed(ws_name)
-            self._refresh_list(highlight=ws_name)
-            self.notify(f"updated {updated.provider}:{updated.label}")
-
-        self.app.push_screen(CredentialFormScreen(existing=cred), done)
-
-    def _pick_and_edit_key(self, ws_name: str) -> None:
-        ws = self.vault.data.get_workspace(ws_name)
-        if ws is None or not ws.providers:
-            return
-        if len(ws.providers) == 1:
-            self._open_edit_key(ws_name, ws.providers[0])
-        else:
-            choices = [(p.provider, f"{p.provider}:{p.label}") for p in ws.providers]
-
-            def pick(choice: str | None) -> None:
-                if choice is None:
-                    return
-                c = next((p for p in ws.providers if p.provider == choice), None)
-                if c:
-                    self._open_edit_key(ws_name, c)
-
-            self.app.push_screen(
-                ChoiceScreen("Edit key", f"Which key to edit in '{ws_name}'?", choices),
-                pick,
-            )
-
-    def action_edit_key(self) -> None:
-        name = self._selected_name()
-        if name is None:
-            self.notify("select a workspace first", severity="warning")
-            return
-        ws = self.vault.data.get_workspace(name)
-        if ws is None or not ws.providers:
-            self.notify("no keys yet — press 'a' to add one", severity="warning")
-            return
-        self._pick_and_edit_key(name)
-
-    def action_set_base(self) -> None:
-        name = self._selected_name()
-        if name is None:
-            self.notify("select a workspace first", severity="warning")
-            return
-        ws = self.vault.data.get_workspace(name)
-        current = (ws.clone_base if ws else "") or self.vault.data.default_clone_base
-
-        def done(value: str | None) -> None:
-            if value is None or ws is None:
-                return
-            ws.clone_base = value.strip() or None
-            self.vault.save()
-            self._mark_config_changed(name)
-            self._refresh_list(highlight=name)
-            shown = ws.clone_base or self.vault.data.default_clone_base
-            self.notify(f"'{name}' syncs into {shown}")
-
-        self.app.push_screen(
-            TextPromptScreen(
-                "Local sync folder",
-                "Absolute or ~-path where this workspace's repos live / are cloned. "
-                "Existing clones are matched by their remote anywhere below it.",
-                current,
             ),
             done,
         )

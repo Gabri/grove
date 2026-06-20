@@ -36,6 +36,7 @@ class Config:
     clone_base: Path
     protocol: str  # "https" | "ssh"
     roots: list[RootSpec]
+    ssh_key: str | None = None  # path to SSH private key; None = use agent
 
     @property
     def use_ssh(self) -> bool:
@@ -62,4 +63,4 @@ def config_from_workspace(vault: VaultData, workspace: Workspace) -> Config:
             f"workspace '{workspace.name}' has no keys/roots to discover"
         )
     base = Path(workspace.clone_base or vault.default_clone_base).expanduser()
-    return Config(clone_base=base, protocol=vault.protocol, roots=roots)
+    return Config(clone_base=base, protocol=workspace.protocol, roots=roots, ssh_key=workspace.ssh_key)

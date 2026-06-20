@@ -93,6 +93,7 @@ def build_unified(
         )
 
     if inspect and pending:
+        use_ssh = config.use_ssh
 
         def _inspect(u: UnifiedNode) -> None:
             status = git_ops.sync_status(u.local_path, do_fetch=do_fetch)
@@ -103,6 +104,9 @@ def build_unified(
                 u.state = NodeState.SYNCED
             else:
                 u.state = NodeState.OUT_OF_SYNC
+            # Flag when local origin protocol doesn't match workspace setting
+            origin = git_ops.get_origin_url(u.local_path)
+            u.remote_mismatch = bool(origin) and (git_ops.url_is_ssh(origin) != use_ssh)
 
         with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as ex:
             list(ex.map(_inspect, pending))

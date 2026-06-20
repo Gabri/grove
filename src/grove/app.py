@@ -31,6 +31,8 @@ from .widgets import LEGEND, node_label
 _TOKEN_USER = {"gitlab": "oauth2", "github": "x-access-token"}
 
 
+
+
 class GroveApp(App):
     CSS = """
     Screen { background: $surface; }
@@ -44,14 +46,19 @@ class GroveApp(App):
     BranchSelectScreen {
         align: center middle;
     }
-    #confirm-box, #form-box {
+    #confirm-box {
         width: 64; height: auto; padding: 1 2;
+        border: thick $primary; background: $panel;
+    }
+    #form-box {
+        width: 72; max-height: 90%; padding: 1 2;
         border: thick $primary; background: $panel;
     }
     #form-box-wide {
         width: 72; max-height: 90%; padding: 1 2;
         border: thick $primary; background: $panel;
     }
+    #keys-list { height: auto; min-height: 3; max-height: 8; border: round $secondary; margin: 0 0 1 0; }
     #ws-box {
         width: 72; height: 80%; padding: 1 2;
         border: thick $primary; background: $panel;
@@ -77,6 +84,7 @@ class GroveApp(App):
         ("U", "update_all", "Update all"),
         ("slash", "filter", "Filter"),
         ("B", "checkout_branch", "Branch"),
+        ("R", "rewrite_remotes", "Rewrite remotes"),
         ("o", "open_web", "Open in browser"),
         ("P", "change_password", "Change password"),
         ("q", "quit", "Quit"),
@@ -478,6 +486,8 @@ class GroveApp(App):
         from concurrent.futures import ThreadPoolExecutor
 
         assert self.forest is not None
+        use_ssh = self.config is not None and self.config.use_ssh
+        ssh_key = self.config.ssh_key if use_ssh and self.config else None
         try:
             repos = [
                 r
@@ -492,10 +502,15 @@ class GroveApp(App):
                     repo.local_path,
                     do_fetch=True,
                     fetch_url=repo.clone_url,
-                    auth=self._auth_for(repo.provider),
+                    auth=None if use_ssh else self._auth_for(repo.provider),
+                    ssh_key=ssh_key,
                 )
                 repo.status = st
                 repo.state = self._state_from_status(st)
+                origin = git_ops.get_origin_url(repo.local_path)
+                repo.remote_mismatch = bool(origin) and (
+                    git_ops.url_is_ssh(origin) != use_ssh
+                )
                 done += 1
                 self.call_from_thread(
                     self.log_msg, f"  [{done}/{len(repos)}] {repo.path}"
@@ -533,10 +548,16 @@ class GroveApp(App):
             depth = 1 if choice == "shallow" else None
             self._bulk_worker([], targets, depth=depth)
 
+        if len(targets) == 1:
+            desc = targets[0].path
+        else:
+            listed = "\n".join(f"  • {r.path}" for r in targets[:8])
+            extra = f"\n  … and {len(targets) - 8} more" if len(targets) > 8 else ""
+            desc = f"{len(targets)} repos\n{listed}{extra}"
         self.push_screen(
             ChoiceScreen(
                 "Clone repos",
-                f"Clone {len(targets)} repo(s) into {self.config.clone_base}?",
+                f"Clone {desc}\ninto {self.config.clone_base}?",
                 [("full", "Clone"), ("shallow", "Shallow (depth 1)")],
             ),
             go,
@@ -634,6 +655,53 @@ class GroveApp(App):
             go,
         )
 
+    def action_rewrite_remotes(self) -> None:
+        """Rewrite origin URLs of cloned repos to match the workspace protocol."""
+        if self.forest is None or self.config is None:
+            return
+        node = self._selected() or self.forest
+        want_ssh = self.config.use_ssh
+        mismatched = [
+            r for r in node.iter_repos()
+            if r.local_path
+            and r.clone_url
+            and git_ops.is_git_repo(r.local_path)
+            and git_ops.url_is_ssh(git_ops.get_origin_url(r.local_path)) != want_ssh
+        ]
+        if not mismatched:
+            proto = "SSH" if want_ssh else "HTTPS"
+            self.log_msg(f"All cloned remotes already use {proto}.")
+            return
+        proto_label = "SSH" if want_ssh else "HTTPS"
+        names = "\n".join(f"  • {r.name}" for r in mismatched)
+
+        def go(confirmed: bool) -> None:
+            if confirmed:
+                self._rewrite_remotes_worker(mismatched)
+
+        self.push_screen(
+            ConfirmScreen(
+                "Rewrite remotes",
+                f"Switch {len(mismatched)} repo(s) to {proto_label}:\n{names}",
+                f"Switch to {proto_label}",
+            ),
+            go,
+        )
+
+    @work(thread=True)
+    def _rewrite_remotes_worker(self, repos: list[UnifiedNode]) -> None:
+        for repo in repos:
+            try:
+                git_ops.set_remote_url(repo.local_path, repo.clone_url)
+                repo.remote_mismatch = False
+                self.call_from_thread(
+                    self.log_msg, f"  {repo.name}: origin → {repo.clone_url}"
+                )
+            except git_ops.GitError as e:
+                self.call_from_thread(self.log_msg, f"  ERROR {repo.name}: {e}")
+        self.call_from_thread(self.log_msg, "Remote rewrite done.")
+        self.call_from_thread(self._rebuild_tree)
+
     @staticmethod
     def _updatable(node: UnifiedNode) -> list[UnifiedNode]:
         return [
@@ -656,14 +724,16 @@ class GroveApp(App):
         """Update then clone, sequentially, with a single tree rebuild at the end."""
         total = len(to_update) + len(to_clone)
         step = 0
+        use_ssh = self.config is not None and self.config.use_ssh
+        ssh_key = self.config.ssh_key if use_ssh and self.config else None
         for repo in to_update:
             step += 1
             self.call_from_thread(
                 self.log_msg, f"  [{step}/{total}] pull {repo.path}…"
             )
-            auth = self._auth_for(repo.provider)
+            auth = None if use_ssh else self._auth_for(repo.provider)
             try:
-                git_ops.update(repo.local_path, fetch_url=repo.clone_url, auth=auth)
+                git_ops.update(repo.local_path, fetch_url=repo.clone_url, auth=auth, ssh_key=ssh_key)
                 repo.status = git_ops.sync_status(repo.local_path)
                 repo.state = self._state_from_status(repo.status)
             except Exception as e:  # noqa: BLE001
@@ -674,9 +744,9 @@ class GroveApp(App):
             self.call_from_thread(
                 self.log_msg, f"  [{step}/{total}] cloning {repo.path}…"
             )
-            auth = self._auth_for(repo.provider)
+            auth = None if use_ssh else self._auth_for(repo.provider)
             try:
-                git_ops.clone(repo.clone_url, repo.local_path, auth=auth, depth=depth)
+                git_ops.clone(repo.clone_url, repo.local_path, auth=auth, depth=depth, ssh_key=ssh_key)
                 repo.status = git_ops.sync_status(repo.local_path)
                 repo.state = self._state_from_status(repo.status)
             except Exception as e:  # noqa: BLE001

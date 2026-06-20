@@ -65,6 +65,16 @@ def _auth_env(auth: GitAuth | None) -> dict | None:
     return env
 
 
+def _ssh_env(key_path: str) -> dict:
+    """Env that forces git to use a specific SSH identity file (bypasses agent)."""
+    expanded = os.path.expanduser(key_path)
+    env = dict(os.environ)
+    env["GIT_SSH_COMMAND"] = (
+        f"ssh -i {expanded} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+    )
+    return env
+
+
 _SECRET_RE = re.compile(r"(://[^/:@\s]+):([^@\s]+)@")
 
 
@@ -165,18 +175,21 @@ def clone(
     timeout: int = 600,
     auth: GitAuth | None = None,
     depth: int | None = None,
+    ssh_key: str | None = None,
 ) -> None:
     """Clone url into dest, creating intermediate dirs to mirror the hierarchy.
 
     The URL must be credential-free; auth (if any) goes through GIT_ASKPASS so
     nothing secret lands in .git/config or the process list.
+    ssh_key (if set) forces a specific identity file, bypassing the SSH agent.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     args = ["clone"]
     if depth:
         args += ["--depth", str(depth)]
     args += [url, str(dest)]
-    _run(args, timeout=timeout, env=_auth_env(auth))
+    env = _ssh_env(ssh_key) if ssh_key else _auth_env(auth)
+    _run(args, timeout=timeout, env=env)
 
 
 def fetch(
@@ -184,18 +197,20 @@ def fetch(
     timeout: int = 180,
     url: str | None = None,
     auth: GitAuth | None = None,
+    ssh_key: str | None = None,
 ) -> None:
     """Fetch. With `url`, fetches from it directly (bypassing a broken/SSH
     origin) and updates origin-tracking refs so ahead/behind stays accurate."""
+    env = _ssh_env(ssh_key) if ssh_key else _auth_env(auth)
     if url:
         _run(
             ["fetch", url, "+refs/heads/*:refs/remotes/origin/*"],
             cwd=repo_dir,
             timeout=timeout,
-            env=_auth_env(auth),
+            env=env,
         )
     else:
-        _run(["fetch", "--all", "--prune"], cwd=repo_dir, timeout=timeout)
+        _run(["fetch", "--all", "--prune"], cwd=repo_dir, timeout=timeout, env=env)
 
 
 def _ensure_upstream(repo_dir: Path) -> str | None:
@@ -225,6 +240,7 @@ def update(
     timeout: int = 180,
     fetch_url: str | None = None,
     auth: GitAuth | None = None,
+    ssh_key: str | None = None,
 ) -> str:
     """Fast-forward only update.
 
@@ -234,14 +250,15 @@ def update(
     repos with no tracking branch configured.
     """
     if fetch_url:
-        fetch(repo_dir, timeout=timeout, url=fetch_url, auth=auth)
+        fetch(repo_dir, timeout=timeout, url=fetch_url, auth=auth, ssh_key=ssh_key)
         upstream = _ensure_upstream(repo_dir)
         if upstream:
             return _run(["merge", "--ff-only", upstream], cwd=repo_dir, timeout=timeout)
         return _run(["merge", "--ff-only", "FETCH_HEAD"], cwd=repo_dir, timeout=timeout)
 
+    env = _ssh_env(ssh_key) if ssh_key else None
     try:
-        return _run(["pull", "--ff-only"], cwd=repo_dir, timeout=timeout)
+        return _run(["pull", "--ff-only"], cwd=repo_dir, timeout=timeout, env=env)
     except GitError as exc:
         msg = str(exc).lower()
         if "no tracking information" not in msg and "no upstream" not in msg:
@@ -262,18 +279,31 @@ def stash(repo_dir: Path) -> str:
     return _run(["stash"], cwd=repo_dir)
 
 
+def set_remote_url(repo_dir: Path, url: str, remote: str = "origin") -> None:
+    """Set the URL of a remote (default: origin)."""
+    _run(["remote", "set-url", remote, url], cwd=repo_dir)
+
+
+def url_is_ssh(url: str | None) -> bool:
+    """Return True if url is an SSH git URL (git@ or ssh://)."""
+    if not url:
+        return False
+    return url.startswith("git@") or url.startswith("ssh://")
+
+
 def sync_status(
     repo_dir: Path,
     do_fetch: bool = False,
     fetch_url: str | None = None,
     auth: GitAuth | None = None,
+    ssh_key: str | None = None,
 ) -> SyncStatus:
     """Inspect a local repo: branch, ahead/behind vs upstream, dirty tree."""
     status = SyncStatus()
     try:
         if do_fetch:
             try:
-                fetch(repo_dir, url=fetch_url, auth=auth)
+                fetch(repo_dir, url=fetch_url, auth=auth, ssh_key=ssh_key)
             except GitError:
                 pass  # offline / no remote: still report local state
 

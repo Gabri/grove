@@ -87,9 +87,14 @@ async def test_credential_form_parses_pasted_url(tmp_path):
             await app.workers.wait_for_complete()
             await pilot.pause()
 
+            # open workspace edit form (now unified: name+folder+protocol+keys)
             await pilot.press("w")
             await pilot.pause()
-            await pilot.press("a")
+            await pilot.press("e")
+            await pilot.pause()
+            assert isinstance(app.screen, WorkspaceFormScreen)
+            # open add-key sub-modal via ctrl+a
+            await pilot.press("ctrl+a")
             await pilot.pause()
             assert isinstance(app.screen, CredentialFormScreen)
             app.screen.query_one("#label", Input).value = "work"
@@ -97,6 +102,10 @@ async def test_credential_form_parses_pasted_url(tmp_path):
             app.screen.query_one("#roots", TextArea).text = (
                 "https://gitlab.client.com/team/platform"
             )
+            await pilot.click("#ok")
+            await pilot.pause()
+            # back in WorkspaceFormScreen — save
+            assert isinstance(app.screen, WorkspaceFormScreen)
             await pilot.click("#ok")
             await pilot.pause()
 
@@ -125,9 +134,8 @@ async def test_rename_workspace(tmp_path):
             await pilot.press("w")
             await pilot.pause()
             assert isinstance(app.screen, WorkspaceManagerScreen)
-            await pilot.press("r")
+            await pilot.press("e")
             await pilot.pause()
-            # r now opens WorkspaceFormScreen (name + base) instead of TextPromptScreen
             assert isinstance(app.screen, WorkspaceFormScreen)
             app.screen.query_one("#name", Input).value = "renamed"
             await pilot.click("#ok")
@@ -168,11 +176,6 @@ async def test_copy_workspace(tmp_path):
             assert app.vault.data.get_workspace("clientx-2") is not None
             copy_ws = app.vault.data.get_workspace("clientx-2")
             assert copy_ws.providers[0].token == "glpat-x"  # copied key
-
-            # copy auto-opens CredentialFormScreen for key editing — cancel it
-            assert isinstance(app.screen, CredentialFormScreen)
-            await pilot.press("escape")
-            await pilot.pause()
 
             # duplicate name must be rejected: try copy again expecting conflict
             assert isinstance(app.screen, WorkspaceManagerScreen)
@@ -237,10 +240,11 @@ async def test_set_clone_base(tmp_path):
             await pilot.press("w")
             await pilot.pause()
             assert isinstance(app.screen, WorkspaceManagerScreen)
-            await pilot.press("b")
+            # base dir now edited via unified workspace form (e)
+            await pilot.press("e")
             await pilot.pause()
-            assert isinstance(app.screen, TextPromptScreen)
-            app.screen.query_one("#value", Input).value = "~/work/clientx"
+            assert isinstance(app.screen, WorkspaceFormScreen)
+            app.screen.query_one("#base", Input).value = "~/work/clientx"
             await pilot.click("#ok")
             await pilot.pause()
             assert (
@@ -283,12 +287,10 @@ async def test_create_vault_then_manage_keys(tmp_path):
 
             await pilot.press("n")
             await pilot.pause()
+            assert isinstance(app.screen, WorkspaceFormScreen)
             app.screen.query_one("#name", Input).value = "clienty"
-            await pilot.click("#ok")
-            await pilot.pause()
-            assert app.vault.data.get_workspace("clienty") is not None
-
-            await pilot.press("a")
+            # add key inline via ctrl+a inside the workspace form
+            await pilot.press("ctrl+a")
             await pilot.pause()
             assert isinstance(app.screen, CredentialFormScreen)
             app.screen.query_one("#label", Input).value = "ey-gl"
@@ -296,8 +298,13 @@ async def test_create_vault_then_manage_keys(tmp_path):
             app.screen.query_one("#roots", TextArea).text = "clienty/team\norg=other"
             await pilot.click("#ok")
             await pilot.pause()
+            # back in workspace form — save
+            assert isinstance(app.screen, WorkspaceFormScreen)
+            await pilot.click("#ok")
+            await pilot.pause()
 
             ws = app.vault.data.get_workspace("clienty")
+            assert ws is not None
             assert len(ws.providers) == 1
             cred = ws.providers[0]
             assert cred.token == "glpat-ey"
