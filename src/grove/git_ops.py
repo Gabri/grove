@@ -304,6 +304,7 @@ def sync_status(
         if do_fetch:
             try:
                 fetch(repo_dir, url=fetch_url, auth=auth, ssh_key=ssh_key)
+                status.fetched = True
             except GitError:
                 pass  # offline / no remote: still report local state
 

@@ -53,6 +53,7 @@ class SyncStatus:
     dirty: bool = False
     has_upstream: bool = True
     detached: bool = False
+    fetched: bool = False  # True when computed after a network git fetch
     error: str | None = None
 
     @property

@@ -57,17 +57,24 @@ def repo_label(node: UnifiedNode) -> Text:
         label.append("  [↔https]" if local_is_https else "  [↔ssh]", style="bold magenta")
 
     if st and node.state is NodeState.OUT_OF_SYNC:
-        bits = []
+        bits: list[tuple[str, str]] = []
         if st.behind:
-            bits.append(f"↓{st.behind}")
+            bits.append((f"↓{st.behind}", "yellow"))
+        elif st.ahead and not st.fetched:
+            # behind unknown: fetch not run yet — remote may have new commits
+            bits.append(("↓?", "dim"))
         if st.ahead:
-            bits.append(f"↑{st.ahead}")
+            bits.append((f"↑{st.ahead}", "yellow"))
         if st.dirty:
-            bits.append("✎")
+            bits.append(("✎", "yellow"))
         if not st.has_upstream:
-            bits.append("no-upstream")
+            bits.append(("no-upstream", "yellow"))
         if bits:
-            label.append("  " + " ".join(bits), style="yellow")
+            label.append("  ")
+            for i, (text, style) in enumerate(bits):
+                if i:
+                    label.append(" ", style="yellow")
+                label.append(text, style=style)
     return label
 
 
