@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import webbrowser
 from pathlib import Path
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Footer, Header, Log, Static, Tree
+from textual.widgets import Header, Log, Static, Tree
 from textual.widgets.tree import TreeNode
 
 from . import git_ops
@@ -40,6 +43,7 @@ class GroveApp(App):
     #tree { height: 1fr; border: round $primary; }
     #log { height: 8; border: round $secondary; }
     #legend { height: 1; padding: 0 1; color: $text-muted; }
+    #keys-bar { height: auto; padding: 0 1; background: $panel; color: $text-muted; }
 
     ConfirmScreen, ChoiceScreen, CreateVaultScreen, UnlockScreen,
     WorkspaceManagerScreen, WorkspaceFormScreen, CredentialFormScreen,
@@ -85,10 +89,19 @@ class GroveApp(App):
         ("slash", "filter", "Filter"),
         ("B", "checkout_branch", "Branch"),
         ("R", "rewrite_remotes", "Rewrite remotes"),
+        ("s", "open_shell", "Shell"),
         ("o", "open_web", "Open in browser"),
         ("P", "change_password", "Change password"),
         ("q", "quit", "Quit"),
     ]
+
+    @classmethod
+    def _keys_hint(cls) -> str:
+        parts = []
+        for key, _, label in cls.BINDINGS:
+            display = "/" if key == "slash" else key
+            parts.append(f"[bold]{display}[/] {label}")
+        return "  ".join(parts)
 
     def __init__(self, vault_path: Path | None = None):
         super().__init__()
@@ -107,7 +120,7 @@ class GroveApp(App):
             yield tree
             yield Log(id="log", highlight=True)
         yield Static(LEGEND, id="legend")
-        yield Footer()
+        yield Static(self._keys_hint(), id="keys-bar", markup=True)
 
     def on_mount(self) -> None:
         self.title = "grove"
@@ -305,6 +318,51 @@ class GroveApp(App):
             return
         webbrowser.open(node.web_url)
         self.log_msg(f"Opened {node.web_url}")
+
+    def action_open_shell(self) -> None:
+        node = self._selected()
+        path: Path | None = None
+        if node is not None and node.kind is NodeKind.REPO:
+            if node.local_path and node.local_path.exists():
+                path = node.local_path
+        elif node is not None and node.kind is NodeKind.GROUP:
+            for r in node.iter_repos():
+                if r.local_path and r.local_path.exists():
+                    path = r.local_path.parent
+                    break
+        if path is None and self.config is not None:
+            path = self.config.clone_base
+        if path is None:
+            self.log_msg("No local path — clone something first.")
+            return
+        try:
+            self._open_terminal_at(path)
+            self.log_msg(f"Shell → {path}")
+        except RuntimeError as e:
+            self.log_msg(f"Terminal error: {e}")
+
+    @staticmethod
+    def _open_terminal_at(path: Path) -> None:
+        _LAUNCHERS: list[tuple[str, list[str]]] = [
+            ("alacritty", ["alacritty", "--working-directory", str(path)]),
+            ("kitty", ["kitty", "--directory", str(path)]),
+            ("wezterm", ["wezterm", "start", "--cwd", str(path)]),
+            ("gnome-terminal", ["gnome-terminal", f"--working-directory={path}"]),
+            ("konsole", ["konsole", "--workdir", str(path)]),
+            ("xfce4-terminal", ["xfce4-terminal", f"--working-directory={path}"]),
+            ("tilix", ["tilix", f"--working-directory={path}"]),
+            ("xterm", ["xterm"]),
+        ]
+        term_env = os.environ.get("TERMINAL", "").strip()
+        if term_env:
+            _LAUNCHERS.insert(0, (term_env, [term_env]))
+        for name, cmd in _LAUNCHERS:
+            if shutil.which(name):
+                subprocess.Popen(cmd, cwd=str(path), start_new_session=True)
+                return
+        raise RuntimeError(
+            "No terminal emulator found. Set $TERMINAL to your terminal executable."
+        )
 
     def action_checkout_branch(self) -> None:
         node = self._selected()

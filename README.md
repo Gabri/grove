@@ -101,6 +101,7 @@ On first launch you set a master password, then create a workspace and add a key
 | `U` | update + clone everything under the selected node (with confirm) |
 | `B` | switch branch on selected repo (popup with branch list) |
 | `R` | rewrite origin URLs of cloned repos to match workspace protocol |
+| `s` | open a shell at the selected repo/group path |
 | `/` | filter the tree by name/path (empty = clear) |
 | `o` | open the selected repo/group in the browser |
 | `P` | change the vault master password |
