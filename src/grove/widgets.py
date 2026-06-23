@@ -47,7 +47,8 @@ def repo_label(node: UnifiedNode) -> Text:
         label.append(f"  [{st.branch}]", style=branch_style)
 
     if node.is_new and node.state is NodeState.MISSING_LOCAL:
-        label.append("  NEW", style="bold magenta reverse")
+        label.append("  ")
+        label.append("NEW", style="bold magenta reverse")
 
     if node.remote_mismatch:
         # show the protocol the local origin IS using (the "wrong" one)
